@@ -1,0 +1,129 @@
+---
+title: "Анализ оттока клиентов онлайн-магазина"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(tidyverse)
+library(plotly)
+library(crosstalk)
+library(DBI)
+library(dplyr)
+library(partykit)
+library(caret)
+library(themis)
+library(rpart)
+```
+
+```{r message = FALSE, warning=FALSE}
+# Клиенты онлайн-магазина
+con <- dbConnect(RMariaDB::MariaDB(), 
+                 user='student2022minor', 
+                 password='DataMinorHSE!2020', 
+                 dbname='ecommerce', 
+                 host='hsepiterdata-1.cqq6v5igyw1z.us-east-2.rds.amazonaws.com',
+                 port = 3315)
+```
+
+```{r}
+activeUse = dbGetQuery(con, "SELECT OrderCount, Tenure, HourSpendOnApp, DaySinceLastOrder, NumberOfDeviceRegistered, PreferredLoginDevice, PreferredPaymentMode, NumberOfAddress, CouponUsed, CashbackAmount, Complain, SatisfactionScore, Churn FROM profile LEFT JOIN useraccount ON profile.CustomerId = useraccount.CustomerId WHERE (Gender = 'Male' AND MaritalStatus = 'Married')")
+
+data = dbGetQuery(con, "SELECT Gender, MaritalStatus, OrderCount, Tenure, PreferredLoginDevice, NumberOfAddress, SatisfactionScore, CashbackAmount, Churn FROM profile LEFT JOIN useraccount ON profile.CustomerId = useraccount.CustomerId")
+
+data = na.omit(data)
+activeUse = activeUse %>% mutate_if(is.character, as.factor)
+activeUse$Churn = as.factor(activeUse$Churn)
+activeUse = na.omit(activeUse)
+
+count = data %>% group_by(Gender, MaritalStatus) %>% summarise(Orders = sum(OrderCount))
+
+dbDisconnect(con)
+
+sharedAll <- SharedData$new(data)
+sharedCount = SharedData$new(count)
+```
+
+Параметры {.sidebar}
+-------------------------------------
+
+```{r}
+filter_select("status", "Семейное положение", sharedCount, ~MaritalStatus)
+filter_checkbox("gender", "Пол", sharedCount, ~Gender)
+```
+
+Row
+-----------------------------------------------------------------------
+
+### Кол-во заказов в зависимости от семейного статуса и гендера
+```{r}
+fig = plot_ly(sharedCount, x=~Gender, y = ~Orders, color = ~MaritalStatus, type = 'bar', hoverinfo = 'y') %>% layout(title = " ",
+         xaxis = list(title = "Гендер"),
+         yaxis = list(title = "Кол-во заказов"))
+fig
+```
+
+### Действующий отток vs отток после измененний
+```{r}
+set.seed(1234)
+ind = createDataPartition(activeUse$Churn, p = 0.8, list = F)
+train = activeUse[ind,]
+test = activeUse[-ind,]
+
+set.seed(8888)
+train_up <- recipe(~., data = train) %>%
+  themis::step_upsample(Churn) %>% 
+  prep(training = train, retain = TRUE) %>% 
+  bake(new_data = NULL)
+
+test2 = test
+test2$Tenure[test2$Tenure < 4] = 
+  sample(c(0, 1, 2, 3, 4, 5, 6), 
+         size = length(test2$Tenure[test2$Tenure < 4]),
+         replace = T, prob = c(0.8, 0.8, 0.8, 0.8, 0.2, 0.2, 0.2))
+
+test2$PreferredLoginDevice[test2$PreferredLoginDevice == "Phone"] = 
+  sample(c("Phone", "Mobile Phone", "Computer"), 
+         size = length(test2$PreferredLoginDevice[test2$PreferredLoginDevice == "Phone"]),
+         replace = T, prob = c(0.8, 0.2, 0.2))
+
+test2$NumberOfAddress[test2$NumberOfAddress > 7] = 
+  sample(c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11), 
+         size = length(test2$NumberOfAddress[test2$NumberOfAddress > 7]),
+         replace = T, prob = c(0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.8, 0.8, 0.8, 0.8))
+
+# Предсказание
+plot.model_up <-
+  rpart(Churn~.,
+        data = train_up,
+        method = "class",
+        cp = 0.01)
+
+plot.pred_up2 = predict(plot.model_up, test2, type = "class")
+
+gpl = ggplot(data.frame(plot.pred_up2)) + geom_bar(aes(x = plot.pred_up2), alpha = 0.7, fill = "darkred") + geom_bar(data = test, aes(x = Churn), alpha = 0.5) + xlab("Уход клиента (нет/да)") + ylab("Количество клиентов")
+ggplotly(gpl)
+```
+
+Row
+-------------------------------------
+
+### Столько человек входит в выделенную подгруппу, на которой проводилось моделирование
+
+```{r}
+value2 = count(activeUse)
+valueBox(value2, color = "success", icon = "fa-pencil")
+```
+
+### На столько снизился процент оттока после изменений
+
+```{r}
+d1 = data.frame(plot.pred_up2) %>% count(plot.pred_up2)
+d2 = data.frame(test) %>% count(Churn)
+
+value1 = paste0(round(d2$n[2]/sum(d1$n)*100, 2) - round(d1$n[2]/sum(d1$n)*100, 2), "%")
+valueBox(value1, icon = "fas fa-chart-pie", color = "primary")
+```
