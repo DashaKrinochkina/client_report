@@ -1,4 +1,4 @@
-**[dashboard-copy.html](file:///C:/Users/Dasha/Downloads/rstudio-export/dashboard-copy.html)**: описание логики анализа, описание данных и препроцессинг, описание целевой переменной, простроение моделей дерева и регрессии, визуализация результатов
+**template-report-copy.Rmd**: description of analysis logic, EDA and preprocessing, training decision tree and regression models, results visualization 
 
-**[dashboard-copy.html](file:///C:/Users/Dasha/Downloads/rstudio-export/template-report-copy.html)**: визуализация наиболее значимых цифр и фич анализа
+**dashboard-copy.Rmd**: visualisation of the most representative features and numbers
 
