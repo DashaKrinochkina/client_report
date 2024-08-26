@@ -1,0 +1,239 @@
+---
+title: 'Проект SQL: Анализ оттока клиентов онлайн-магазина'
+author: "Криночкина Дарья, dskrinochkina"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+## Задача
+
+Необходимо выяснить вероятные причины ухода клиентов онлайн-магазина и попытаться смоделировать действия, которые могла бы предпринять компания, чтобы сократить отток.
+
+## Анализ
+
+```{r}
+?pvalue
+v1 = c(4, 5, 6, 3, 1, 4, 9, 15, 8, 9, 23, 17, 10, 17)
+v2 = c(5, 14, 4, 9, 2, 16, 1, 2, 24, 13, 29, 17, 1, 6)
+t.test(v1,v2)
+cor.test(v2, v1)
+```
+
+
+### Данные и логика анализа
+
+Для анализа будем использовать базу данных покупателей онлайн-магазина.
+```{r message = FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(DBI)
+library(RMariaDB)
+library(rpart)
+library(partykit)
+library(caret)
+library(tidymodels)
+library(vip)
+library(plotly)
+```
+
+```{r message = FALSE, warning=FALSE}
+# Клиенты онлайн-магазина
+con <- dbConnect(RMariaDB::MariaDB(), 
+                 user='student2022minor', 
+                 password='DataMinorHSE!2020', 
+                 dbname='ecommerce', 
+                 host='hsepiterdata-1.cqq6v5igyw1z.us-east-2.rds.amazonaws.com',
+                 port = 3315)
+```
+
+Рассмотрим, какие клиенты совершают больше всего заказов в зависимости от семейного статуса и гендера.
+```{r message = FALSE, warning=FALSE}
+dbGetQuery(con, "SELECT MaritalStatus, SUM(OrderCount) as Orders FROM profile LEFT JOIN useraccount ON profile.CustomerId = useraccount.CustomerId GROUP BY MaritalStatus")
+
+dbGetQuery(con, "SELECT Gender, SUM(OrderCount) as Orders FROM profile LEFT JOIN useraccount ON profile.CustomerId = useraccount.CustomerId GROUP BY Gender")
+```
+
+Отбираем мужчин с семейным статусом Married, так как они совершали больше всего заказов. В данных преобразуем переменные в фактор и удалим пустые значения.
+
+```{r message = FALSE, warning=FALSE}
+activeUse = dbGetQuery(con, "SELECT OrderCount, Tenure, HourSpendOnApp, DaySinceLastOrder, NumberOfDeviceRegistered, PreferredLoginDevice, PreferredPaymentMode, NumberOfAddress, CouponUsed, CashbackAmount, Complain, SatisfactionScore, Churn FROM profile LEFT JOIN useraccount ON profile.CustomerId = useraccount.CustomerId WHERE (Gender = 'Male' AND MaritalStatus = 'Married')")
+
+# это нужно для сравнения распределения оттока по общим данным и по подгруппе
+query_full = dplyr::tbl(con, "useraccount") %>% collect()
+
+dbDisconnect(con)
+
+# Преобразование переменных в фактор, удаление na
+activeUse = activeUse %>% mutate_if(is.character, as.factor)
+activeUse$Churn = as.factor(activeUse$Churn)
+activeUse = na.omit(activeUse)
+```
+
+Распределение целевой переменной в подгруппе несильно отличается от общих данных: процент оттока немного ниже (14.4 % в подгруппе, 20.2 % в общих данных)
+
+```{r}
+ggplot() + geom_bar(data = query_full, aes(x = factor(Churn)), alpha = 0.7, fill = "lightblue") + geom_bar(data = activeUse, aes(x = Churn), alpha = 0.7) + xlab("Уход клиента (нет/да)") + ylab("Количество клиентов") + ggtitle("Распределение целевой переменной")
+```
+
+### Модель
+
+Построим две модели: дерево и логистическая регрессия.
+```{r message = FALSE, warning=FALSE, echo=F, include=F}
+set.seed(1234)
+ind = createDataPartition(activeUse$Churn, p = 0.8, list = F)
+train = activeUse[ind,]
+test = activeUse[-ind,]
+
+# Модель дерева
+plot.model <-
+  rpart(Churn~.,
+        data = train,
+        method = "class",
+        cp = 0.01)
+# rpart.plot(plot.model)
+plot.pred = predict(plot.model, test, type = "class")
+
+# Логистическая модель
+log.model = logistic_reg() %>% fit(Churn~., data = train)
+log.pred = predict(log.model, test)
+
+# Оценка моделей
+confusionMatrix(plot.pred, test$Churn)
+
+table(log.pred$.pred_class, test$Churn)
+```
+
+```{r message = FALSE, warning=FALSE}
+test %>% 
+  mutate(pred =log.pred$.pred_class) %>% 
+  conf_mat(estimate = pred, truth = Churn) %>% 
+  summary()
+```
+
+По результатам оценки моделей accuracy получилась очень высокой, однако у specificity показатель довольно низкий, а значит уход клиента предсказывается недостаточно точно.
+Выборка несбалансирована. 
+
+Далее будем работать с моделью дерева, так как она показала большую specificity. Проведём балансировку тренировочной выборки и построим новую модель.
+
+```{r message = FALSE, warning=FALSE, echo=F, include=F}
+set.seed(8888)
+# Создание сбалансированной выборки
+train_up <- recipe(~., data = train) %>%
+  themis::step_upsample(Churn) %>% 
+  prep(training = train, retain = TRUE) %>% 
+  bake(new_data = NULL)
+
+# ФИНАЛЬНАЯ МОДЕЛЬ
+plot.model_up <-
+  rpart(Churn~.,
+        data = train_up,
+        method = "class",
+        cp = 0.01)
+#part.plot(plot.model)
+
+# 1 предсказание
+plot.pred_up = predict(plot.model_up, test, type = "class")
+
+# Оценка модели
+confusionMatrix(plot.pred_up, test$Churn)
+
+```
+
+```{r message = FALSE, warning=FALSE}
+ggplot(data.frame(plot.pred_up)) + geom_bar(aes(x = plot.pred_up), alpha = 0.7, fill = "darkblue") + xlab("Уход клиента (нет/да)") + ylab("Количество клиентов") + ggtitle("Предсказываемое распределение целевой переменной")
+```
+
+После балансировки понизились accuracy и sensitivity, но сильно повысилась specificity.
+Попробуем выявить значимые переменные.
+
+```{r message = FALSE, warning=FALSE}
+vip(plot.model_up)
+
+fig <- plot_ly(test,
+  type='histogram',
+  x=~PreferredLoginDevice[Churn == 0],
+  bingroup=1, name = "0")
+
+fig <- fig %>% add_trace(test,
+  type='histogram',
+  x=~PreferredLoginDevice[Churn == 1],
+  bingroup=1, color = I("darkred"), name = "1")
+
+fig <- fig %>% layout(
+  barmode="group",
+  bargap=0.1, xaxis = list(title = "Тип устройства"), yaxis = list(title = "Кол-во клиентов"))
+  
+fig = fig %>% layout(title = "Отток в зависимости от предпочитаемого способа заказа")
+fig
+
+noa = ggplot(test) + geom_bar(aes(x = NumberOfAddress, fill = Churn), position = "fill") + xlab("Кол-во сохранённых адресов") + ylab("Процент оттока") + ggtitle("Отток в зависимости от кол-ва сохранённых адресов в аккаунте")
+ggplotly(noa)
+```
+
+```{r message = FALSE, warning=FALSE, echo=F, include=F}
+ggplot(train_up) + geom_bar(aes(x = Tenure, fill = Churn), position = "fill")
+ggplot(test) + geom_bar(aes(x = Tenure, fill = Churn), position = "fill")
+```
+**Итак, анализ переменных на тестовой выборке показал, что:**
+
+- Тестовая выборка показывает, что люди в основном уходят на начальном этапе пользования онлайн-магазина;
+
+- Также можно заметить, что часто уходят люди, у которых сохранено большое количество адресов доставки;
+
+- Процент оттока выше среди людей, которые совершают заказы через звонки по телефону (Phone).
+
+### Симуляция
+
+**Для того, чтобы уменьшить отток, попробуем симулировать следующие изменения:**
+
+- Увеличить время пользования приложением, т.е. попробовать удержать клиентов (например, предлагать первые три месяца бесплатной доставки);
+
+- Смотивировать людей на заказ через приложение или сайт, а не через звонки (например, предлагать скидки и купоны за заказы через сайт или приложение);
+
+- Предлагать удалять адреса, которые давно не использовались (уменьшить кол-во сохранённых адресов).
+```{r message = FALSE, warning=FALSE, echo=F, include=F}
+test2 = test
+test2$Tenure[test2$Tenure < 4] = 
+  sample(c(0, 1, 2, 3, 4, 5, 6), 
+         size = length(test2$Tenure[test2$Tenure < 4]),
+         replace = T, prob = c(0.8, 0.8, 0.8, 0.8, 0.2, 0.2, 0.2))
+
+test2$PreferredLoginDevice[test2$PreferredLoginDevice == "Phone"] = 
+  sample(c("Phone", "Mobile Phone", "Computer"), 
+         size = length(test2$PreferredLoginDevice[test2$PreferredLoginDevice == "Phone"]),
+         replace = T, prob = c(0.8, 0.2, 0.2))
+
+test2$NumberOfAddress[test2$NumberOfAddress > 7] = 
+  sample(c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11), 
+         size = length(test2$NumberOfAddress[test2$NumberOfAddress > 7]),
+         replace = T, prob = c(0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.8, 0.8, 0.8, 0.8))
+
+
+# 2 предсказание
+plot.pred_up2 = predict(plot.model_up, test2, type = "class")
+
+data.frame(plot.pred_up2) %>% count(plot.pred_up2)
+data.frame(test) %>% count(Churn)
+
+# Сравнение с предыдущим предсказанием
+ggplot(data.frame(plot.pred_up2)) + geom_bar(aes(x = plot.pred_up2), alpha = 0.7, fill = "darkred") + geom_bar(data = data.frame(plot.pred_up), aes(x = plot.pred_up), alpha = 0.5)
+```
+
+```{r message = FALSE, warning=FALSE}
+# Сравнение с оттоком в тестовой выборке
+gpl = ggplot(data.frame(plot.pred_up2)) + geom_bar(aes(x = plot.pred_up2), alpha = 0.7, fill = "darkred") + geom_bar(data = test, aes(x = Churn), alpha = 0.5) + xlab("Уход клиента (нет/да)") + ylab("Количество клиентов") + ggtitle("Сравнение предсказываемого и действительного оттока")
+ggplotly(gpl)
+```
+
+### Дэшборд
+
+- Вынесены результаты общего анализа: какая группа покупателей наиболее активна, объём наблюдений, на которых проводилось предсказание и моделирование.
+
+- Вынесены результаты симуляции изменений, насколько удалось снизить отток.
+
+## Общие выводы
+
+1. Основными переменными, влияющими на отток клиентов оказались время пользования приложением, предпочитаемый способ осуществления заказа и кол-во сохранённых адресов доставки.
+
+2. Несмотря на то, что было предложено несколько стратегий уменьшения оттока, результаты повторного предсказания после симуляции не показали сильного эффекта, если сравнивать отток с тестовой выборкой. Однако при большем объёме данных эффект может быть более заметным.
